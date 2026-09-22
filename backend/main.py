@@ -1,0 +1,1718 @@
+import io
+import os
+import threading
+import uuid
+import csv
+import json
+import time
+import requests
+from datetime import datetime, timedelta, timezone
+from functools import lru_cache
+from pathlib import Path
+from typing import Annotated, Literal
+
+import numpy as np
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
+from PIL import Image
+from pydantic import BaseModel, Field
+
+from backend.app.config import DATA_DIR, OLLAMA_HOST, OLLAMA_MODEL, TILE_SIZE_PX
+from backend.app.change import storyline, temporal_signature
+from backend.app.change import adaptive, brief, heatmap, sar
+from backend.app.change.detector import analyze_tile_pair
+from backend.app.discovery import clustering
+from backend.app.geospatial import catalog_db as db
+from backend.app.index import search as index_search
+from backend.app.index.vector_index import VectorIndex
+from backend.app.pipeline import onboard_aoi as onboarding
+from backend.app.review import queue as review_queue
+from backend.app.geospatial.rendering import has_valid_multispectral_data
+from backend.app.geospatial.sar_features import find_matching_sar_observation, find_matching_sar_pair
+from backend.app.geospatial.sar_rendering import render_sar_visuals
+from .rendering import difference_image, mosaic_thumbnail, tile_thumbnail
+
+ROOT = Path(__file__).resolve().parent.parent
+GENERATED_DIR = Path(os.getenv("SI_GENERATED_DIR", ROOT / "data" / "generated"))
+FRONTEND_DIST = ROOT / "frontend" / "dist"
+JOB_LOCK = threading.Lock()
+JOBS: dict[str, dict] = {}
+QUALITY_CACHE_TTL = 30.0
+QUALITY_CACHE: tuple[float, dict] | None = None
+
+
+class ExportSceneProvenance(BaseModel):
+	scene_path: str
+	acquisition_date: str | None
+	sensor: str | None
+	cloud_cover_percent: float | None
+	acquisition_date_source: str | None
+
+
+class ExportRow(BaseModel):
+	candidate_id: str
+	tile_id: str
+	aoi_name: str | None
+	change_type: str | None
+	confidence: float | None
+	combined_score: float | None
+	date_before: str
+	date_after: str
+	earliest_supported_date: str | None
+	embedding_drift: float | None
+	spectral_delta: float | None
+	pixel_diff_score: float | None
+	suppression_reason: str | None
+	analyst_decision: str | None
+	decision_reason: str | None
+	decision_timestamp: str | None
+	processing_version: str | None
+	model_name: str
+	scene_before: ExportSceneProvenance | None
+	scene_after: ExportSceneProvenance | None
+
+
+class ReviewDecision(BaseModel):
+	decision: Literal["CONFIRM", "REJECT"]
+	reason: str | None = None
+
+
+class SARIngestRequest(BaseModel):
+	scene_path: str
+	acquisition_date: str
+	tile_id: str | None = None
+	product_type: Literal["GRD", "IW_MONTHLY_MOSAIC"] = "GRD"
+	period_start: str | None = None
+	period_end: str | None = None
+	aoi_id: int | None = None
+	metadata: dict | None = None
+
+
+class OnboardRequest(BaseModel):
+	name: str
+	source_folder: str
+	priority_tier: str = "medium"
+	priority_geojson: str | None = None
+
+
+class AOIPriorityUpdate(BaseModel):
+	priority_tier: str | None = None
+	priority_geojson: str | None = None
+
+
+class Stats(BaseModel):
+	aoi_count: int
+	scene_count: int
+	tile_count: int
+	vector_count: int
+	candidates_scored: int
+	candidates_promoted: int
+	candidates_confirmed: int
+	candidates_suppressed: int
+	discovery_clusters: int
+	accelerating_tiles: int
+	sar_supported_candidates: int
+	sar_status: str
+	learner_status: str
+	learner_examples: int
+	llm_available: bool
+	llm_model_pulled: bool
+	llm_model: str
+	processing_version: str | None
+	last_run: str | None
+
+
+class AOI(BaseModel):
+	aoi_id: str
+	name: str
+	bbox: tuple[float, float, float, float]
+	start_date: str | None
+	end_date: str | None
+	scene_count: int
+	tile_count: int
+	mosaic_thumbnail_url: str | None
+	last_activity: str | None
+
+
+class TimelineEntry(BaseModel):
+	date: str
+	scene_id: str
+	sensor: str | None
+	cloud_fraction: float | None
+	tile_count: int
+	acquisition_date_source: str | None
+	thumbnail_url: str | None
+
+
+class MosaicTile(BaseModel):
+	tile_id: str
+	vector_id: int | None
+	x: int
+	y: int
+	width: int
+	height: int
+	cluster_id: int | None
+	has_change_candidate: bool
+
+
+class Mosaic(BaseModel):
+	aoi_id: str
+	date: str
+	image_url: str
+	width: int
+	height: int
+	tiles: list[MosaicTile]
+
+
+class TileDetail(BaseModel):
+	tile_id: str
+	vector_id: int | None
+	aoi_id: str
+	scene_id: str
+	date: str
+	acquisition_date_source: str | None
+	sensor: str | None
+	lat: float
+	lon: float
+	bbox: tuple[float, float, float, float]
+	ndvi_mean: float | None
+	ndwi_mean: float | None
+	cloud_fraction: float | None
+	valid_pixel_fraction: float | None
+	cluster_id: int | None
+	processing_version: str | None
+	thumbnail_url: str | None
+
+
+class TemporalFrame(BaseModel):
+	date: str
+	sensor: str | None = None
+	image_url: str | None = None
+	thumbnail_url: str | None = None
+	stage: str | None = None
+	score: float | None = None
+	score_source: str | None = None
+	quality: str | None = None
+	selected: bool = False
+	asset_tile_id: str | None = None
+	asset_aoi_id: str | None = None
+	location: str | None = None
+
+
+class TemporalEvolution(BaseModel):
+	tile_id: str
+	aoi_id: str | None = None
+	location: str | None = None
+	trend: str | None = None
+	velocity: float | None = None
+	acceleration: float | None = None
+	storyline: str | None = None
+	frames: list[TemporalFrame]
+
+
+class SearchResult(BaseModel):
+	tile_id: str
+	vector_id: int | None
+	reference_vector_id: int | None = None
+	aoi_id: str
+	aoi_name: str | None
+	date: str
+	similarity: float
+	lat: float
+	lon: float
+	thumbnail_url: str | None
+	reference_thumbnail_url: str | None
+	reference_date: str | None
+	analysis_available: bool
+	change_candidate_id: str | None = None
+
+
+class CompareResult(BaseModel):
+	difference_image_url: str | None
+
+
+class ChangeCandidate(BaseModel):
+	candidate_id: str
+	vector_id: int | None
+	tile_id: str
+	aoi_id: str
+	aoi_name: str | None
+	before_date: str
+	after_date: str
+	embedding_drift: float | None
+	spectral_delta: float | None
+	combined_score: float | None
+	change_type: str | None
+	confidence: float | None
+	status: Literal["OPEN", "CONFIRMED", "REJECTED", "SUPPRESSED"]
+	suppressed: bool
+	suppression_reason: str | None
+	earliest_supported_date: str | None
+	before_thumbnail_url: str | None
+	after_thumbnail_url: str | None
+	before_source_available: bool
+	after_source_available: bool
+	source_unavailable_reason: str | None
+	land_cover: str | None = None
+	priority_score: float | None = None
+	priority_reasons: list[str] = []
+	predicted_confirm_prob: float | None = None
+	modality: str | None = None
+	sar_score: float | None = None
+	fused_score: float | None = None
+	sar_only: bool = False
+	heatmap_spectral_url: str | None = None
+	llm_narrative: str | None = None
+
+
+class ReviewQuality(BaseModel):
+	total_candidates: int
+	displayable_candidates: int
+	cloud_suppressed: int
+	snow_suppressed: int
+	pixel_quality_suppressed: int
+	seasonal_suppressed: int
+	below_threshold_suppressed: int
+	other_quality_suppressed: int
+	source_imagery_unavailable: int
+
+
+class NdviPoint(BaseModel):
+	date: str
+	ndvi_mean: float | None
+	ndwi_mean: float | None
+	cloud_fraction: float | None
+
+
+class ChangeEvidence(BaseModel):
+	before_date: str
+	after_date: str
+	change_region: str | None
+	visual_difference_summary: str
+	before_ndvi: float | None
+	after_ndvi: float | None
+	ndvi_change: float | None
+	spectral_change: float | None
+	semantic_change: float | None
+	quality: str
+	confound_information: list[str]
+	candidate_interpretation: str
+	confidence: float | None
+	difference_image_url: str | None
+	changed_fraction: float | None
+	centroid_x: float | None
+	centroid_y: float | None
+	narrative: str
+
+
+class ChangeDetail(ChangeCandidate):
+	before_image_url: str | None
+	after_image_url: str | None
+	lat: float
+	lon: float
+	bbox: tuple[float, float, float, float]
+	ndvi_series: list[NdviPoint]
+	quality_notes: list[str]
+	acquisition_date_source: str | None
+	processing_version: str | None
+	evidence: ChangeEvidence
+	sar_evidence: dict | None = None
+
+
+class ReviewResponse(BaseModel):
+	ok: bool
+
+
+class AuditLogEntry(BaseModel):
+	log_id: str
+	candidate_id: str
+	tile_id: str | None
+	decision: str
+	reason: str | None
+	created_at: str
+
+
+class Cluster(BaseModel):
+	cluster_id: int
+	member_count: int
+	aoi_ids: list[str]
+	representative_thumbnail_url: str | None
+	label: str | None
+	start_date: str | None
+	end_date: str | None
+
+
+class ClusterMember(BaseModel):
+	tile_id: str
+	vector_id: int | None
+	aoi_id: str
+	date: str
+	thumbnail_url: str | None
+
+
+class OnboardScene(BaseModel):
+	scene_id: str
+	date: str | None
+	status: str
+	message: str | None
+
+
+class OnboardJob(BaseModel):
+	job_id: str
+	status: Literal["queued", "running", "done", "failed"]
+	progress: int
+	message: str | None
+	aoi_id: str | None
+	scenes_found: int | None
+	scenes_ingested: int | None
+	scenes_failed: int | None
+	tiles_added: int | None
+	warnings: list[str]
+	scenes: list[OnboardScene]
+
+
+class TextSearchRequest(BaseModel):
+	query: str
+	aoi_id: str | None = None
+	date: str | None = None
+	date_from: str | None = None
+	date_to: str | None = None
+	k: int = Field(default=12, ge=1, le=100)
+
+
+app = FastAPI(title="Satellite Intelligence API")
+
+raw_origins = os.getenv("CORS_ALLOWED_ORIGINS")
+default_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:4173",
+    "http://127.0.0.1:4173",
+    "http://localhost:4174",
+    "http://127.0.0.1:4174",
+    "http://0.0.0.0:4173",
+    "http://0.0.0.0:4174",
+]
+origins = [item.strip() for item in (raw_origins or ",".join(default_origins)).split(",") if item.strip()]
+if not origins:
+    origins = default_origins
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$",
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Accept", "Accept-Language", "Authorization", "Content-Type", "X-Requested-With"],
+)
+app.mount("/generated", StaticFiles(directory=GENERATED_DIR, check_dir=False), name="generated")
+db.init_db()
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "geospectra-api"}
+
+
+def public_url(request: Request, path: Path | None) -> str | None:
+	if path is None:
+		return None
+	return f"{str(request.base_url).rstrip('/')}/generated/{path.relative_to(GENERATED_DIR).as_posix()}"
+
+
+@lru_cache(maxsize=4096)
+def source_available(tile_path: str | None) -> bool:
+	if not tile_path:
+		return False
+	path = Path(tile_path)
+	return path.exists() and has_valid_multispectral_data(path)
+
+
+def scene_id(aoi_slug: str, date: str | None) -> str | None:
+	return f"{aoi_slug}-S2-{date.replace('-', '')}" if date else None
+
+
+def aoi_row(slug: str):
+	row = db.get_aoi_by_name(slug)
+	if row is None:
+		raise HTTPException(404, f"AOI not found: {slug}")
+	return row
+
+
+def tile_bbox(row) -> list[float]:
+	return [row["minlon"], row["minlat"], row["maxlon"], row["maxlat"]]
+
+
+def tile_public(row, request: Request) -> dict:
+	aoi = db.get_aoi(row["aoi_id"])
+	thumbnail = None
+	if source_available(row["tile_path"]):
+		thumbnail = public_url(request, tile_thumbnail(row["tile_path"], GENERATED_DIR / "thumbnails", row["vector_id"]))
+	return {
+		"tile_id": row["tile_id"], "vector_id": row["vector_id"], "aoi_id": aoi["name"] if aoi else str(row["aoi_id"]),
+		"scene_id": scene_id(aoi["name"] if aoi else str(row["aoi_id"]), row["acquisition_date"]),
+		"date": row["acquisition_date"], "acquisition_date_source": scene_source(row["scene_path"]),
+		"sensor": row["sensor"], "lat": (row["minlat"] + row["maxlat"]) / 2, "lon": (row["minlon"] + row["maxlon"]) / 2,
+		"bbox": tile_bbox(row), "ndvi_mean": row["ndvi_mean"], "ndwi_mean": row["ndwi_mean"],
+		"cloud_fraction": row["cloud_fraction"], "valid_pixel_fraction": row["valid_pixel_fraction"],
+		"cluster_id": row["cluster_id"], "processing_version": row["processing_version"], "thumbnail_url": thumbnail,
+	}
+
+
+def _observation_thumbnail_url(request: Request, row) -> str | None:
+	tile_path = _obj_value(row, "tile_path")
+	vector_id = _obj_value(row, "vector_id")
+	if not row or not tile_path:
+		return None
+	if not Path(tile_path).exists():
+		return None
+	if not has_valid_multispectral_data(tile_path):
+		return None
+	return public_url(request, tile_thumbnail(tile_path, GENERATED_DIR / "thumbnails", vector_id))
+
+
+def _normalize_date(value: str | None):
+	if not value:
+		return None
+	try:
+		return datetime.fromisoformat(value).date().isoformat()
+	except ValueError:
+		return None
+
+
+def _obj_value(obj, key: str, default=None):
+	if obj is None:
+		return default
+	if isinstance(obj, dict):
+		return obj.get(key, default)
+	try:
+		return obj[key]
+	except (KeyError, TypeError, IndexError):
+		return default
+
+
+def _row_value(row, key: str, default=None):
+	return _obj_value(row, key, default)
+
+
+def _resolve_query_dates(tile_id: str, from_date: str | None, to_date: str | None):
+	history = db.get_tile_history(tile_id)
+	if not history:
+		return None, None, []
+	obs_dates = [row["acquisition_date"] for row in history if _obj_value(row, "acquisition_date")]
+	if not obs_dates:
+		return None, None, []
+	start = min(obs_dates)
+	end = max(obs_dates)
+	requested_from = _normalize_date(from_date) if from_date else start
+	requested_to = _normalize_date(to_date) if to_date else end
+	if requested_from is None:
+		requested_from = start
+	if requested_to is None:
+		requested_to = end
+	if requested_from < start:
+		requested_from = start
+	if requested_to > end:
+		requested_to = end
+	filtered = [row for row in history if _obj_value(row, "acquisition_date") and requested_from <= row["acquisition_date"] <= requested_to]
+	if not filtered:
+		filtered = history
+		requested_from = min(obs_dates)
+		requested_to = max(obs_dates)
+	return requested_from, requested_to, filtered
+
+
+def _sar_observation_for_date(tile_id: str, target_date: str):
+	return find_matching_sar_observation(tile_id, target_date)
+
+
+def _sar_public(row, request: Request) -> dict | None:
+	if row is None:
+		return None
+	visuals = render_sar_visuals(row, GENERATED_DIR / "sar")
+	return {
+		"observation_id": row["sar_tile_id"],
+		"acquisition_datetime": row["acquisition_datetime"],
+		"product_type": row["product_type"],
+		"vv_mean_db": row["vv_mean_db"], "vh_mean_db": row["vh_mean_db"],
+		"vv_minus_vh_db": row["vv_minus_vh_db"], "vv_std_db": row["vv_std_db"],
+		"vh_std_db": row["vh_std_db"], "valid_fraction": row["valid_pixels"],
+		"visuals": {name: public_url(request, Path(path)) if path else None for name, path in visuals.items()},
+	}
+
+
+def scene_source(scene_path: str) -> str | None:
+	with db.get_conn() as conn:
+		row = conn.execute("SELECT acquisition_date_source FROM scenes WHERE scene_path = ?", (scene_path,)).fetchone()
+	return row["acquisition_date_source"] if row else None
+
+
+def latest_decisions() -> dict[int, object]:
+	with db.get_conn() as conn:
+		rows = conn.execute("SELECT * FROM audit_log ORDER BY decided_at DESC, log_id DESC").fetchall()
+	return {row["candidate_id"]: row for row in rows}
+
+
+def candidate_status(row, decisions: dict[int, object]) -> str:
+	if row["suppressed"]:
+		return "SUPPRESSED"
+	decision = decisions.get(row["candidate_id"])
+	if decision is None:
+		return "OPEN"
+	return "CONFIRMED" if decision["analyst_decision"] == "confirm" else "REJECTED"
+
+
+def source_unavailable_detail(tile_path: str | None, label: str = "source") -> str | None:
+	if not tile_path:
+		return f"{label.title()} imagery is unavailable because the tile path is missing."
+	path = Path(tile_path)
+	if not path.exists():
+		return f"{label.title()} imagery is unavailable because the stored tile file is missing."
+	if not has_valid_multispectral_data(path):
+		return f"{label.title()} imagery is unavailable because the stored raster failed the multispectral validity check (invalid or all-zero bands)."
+	return None
+
+
+def candidate_public(row, request: Request, decisions: dict[int, object]) -> dict:
+	before = db.get_tile(row["vector_id_before"])
+	after = db.get_tile(row["vector_id_after"])
+	aoi = db.get_aoi(after["aoi_id"] if after else None)
+	before_available = bool(before and source_available(before["tile_path"]))
+	after_available = bool(after and source_available(after["tile_path"]))
+	before_url = public_url(request, tile_thumbnail(before["tile_path"], GENERATED_DIR / "thumbnails", before["vector_id"])) if before_available else None
+	after_url = public_url(request, tile_thumbnail(after["tile_path"], GENERATED_DIR / "thumbnails", after["vector_id"])) if after_available else None
+	before_reason = source_unavailable_detail(before["tile_path"], "before") if before and not before_available else None
+	after_reason = source_unavailable_detail(after["tile_path"], "after") if after and not after_available else None
+	reasons = []
+	if row["suppression_reason"] and "source_imagery_unavailable" in row["suppression_reason"]:
+		reasons.append(row["suppression_reason"])
+	if before_reason:
+		reasons.append(before_reason)
+	if after_reason:
+		reasons.append(after_reason)
+	source_reason = " ".join(dict.fromkeys(reasons)) or None
+	return {
+		"candidate_id": str(row["candidate_id"]), "vector_id": row["vector_id_after"], "tile_id": row["tile_id"],
+		"aoi_id": aoi["name"] if aoi else None, "aoi_name": aoi["name"] if aoi else None,
+		"before_date": row["date_before"], "after_date": row["date_after"], "embedding_drift": row["embedding_drift"],
+		"spectral_delta": row["spectral_delta"], "combined_score": row["combined_score"], "change_type": row["change_type"],
+		"confidence": row["change_type_confidence"], "status": candidate_status(row, decisions), "suppressed": bool(row["suppressed"]),
+		"suppression_reason": row["suppression_reason"], "earliest_supported_date": row["earliest_supported_date"],
+		"before_thumbnail_url": before_url, "after_thumbnail_url": after_url,
+		"before_source_available": before_available, "after_source_available": after_available,
+		"source_unavailable_reason": source_reason,
+		"land_cover": row["land_cover"], "priority_score": row["priority_score"],
+		"priority_reasons": json.loads(row["priority_reasons"] or "[]"),
+		"predicted_confirm_prob": row["predicted_confirm_prob"], "modality": row["modality"],
+		"sar_score": row["sar_score"], "fused_score": row["fused_score"],
+		"sar_only": bool(row["sar_only"] or 0),
+		"heatmap_spectral_url": row["heatmap_spectral"],
+		"llm_narrative": row["llm_narrative"],
+	}
+
+
+def search_public(result, request: Request) -> dict:
+	row = db.get_tile(result.vector_id)
+	if row is None:
+		return {}
+	aoi = db.get_aoi(row["aoi_id"])
+	thumbnail = public_url(request, tile_thumbnail(row["tile_path"], GENERATED_DIR / "thumbnails", row["vector_id"])) if source_available(row["tile_path"]) else None
+	reference = next(
+		(previous for previous in reversed(db.get_tile_history(row["tile_id"]))
+		 if previous["acquisition_date"] < row["acquisition_date"]),
+		None,
+	)
+	reference_available = bool(reference and source_available(reference["tile_path"]))
+	reference_thumbnail = (
+		public_url(request, tile_thumbnail(reference["tile_path"], GENERATED_DIR / "thumbnails", reference["vector_id"]))
+		if reference_available else None
+	)
+	with db.get_conn() as conn:
+		candidate = conn.execute(
+			"SELECT candidate_id FROM change_candidates WHERE vector_id_after=? ORDER BY candidate_id DESC LIMIT 1",
+			(row["vector_id"],),
+		).fetchone()
+	return {"tile_id": row["tile_id"], "vector_id": row["vector_id"], "aoi_id": aoi["name"] if aoi else None, "aoi_name": aoi["name"] if aoi else None,
+			"date": row["acquisition_date"], "similarity": result.similarity, "lat": (row["minlat"] + row["maxlat"]) / 2,
+			"lon": (row["minlon"] + row["maxlon"]) / 2, "thumbnail_url": thumbnail,
+			"reference_thumbnail_url": reference_thumbnail, "reference_vector_id": reference["vector_id"] if reference_available else None,
+			"reference_date": reference["acquisition_date"] if reference_available else None,
+			"analysis_available": candidate is not None,
+			"change_candidate_id": str(candidate["candidate_id"]) if candidate else None}
+
+
+@app.get("/stats", response_model=Stats)
+def stats():
+	with db.get_conn() as conn:
+		counts = {table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("aois", "scenes", "tiles", "change_candidates")}
+		last_run = conn.execute("SELECT MAX(ingested_at) FROM scenes").fetchone()[0]
+		discovery_clusters = conn.execute("SELECT COUNT(DISTINCT cluster_id) FROM tiles WHERE cluster_id IS NOT NULL AND cluster_id != -1").fetchone()[0]
+		accelerating_tiles = conn.execute("SELECT COUNT(*) FROM tiles WHERE velocity_trend='accelerating'").fetchone()[0]
+		sar_supported_candidates = conn.execute("SELECT COUNT(*) FROM change_candidates WHERE sar_score IS NOT NULL").fetchone()[0]
+		registered_sar = conn.execute("SELECT COUNT(*) FROM sar_tiles").fetchone()[0]
+		confirmed = conn.execute("""SELECT COUNT(*) FROM change_candidates cc WHERE EXISTS
+			(SELECT 1 FROM audit_log al WHERE al.candidate_id=cc.candidate_id AND al.analyst_decision='confirm'
+			 AND al.log_id=(SELECT MAX(log_id) FROM audit_log WHERE candidate_id=cc.candidate_id))""").fetchone()[0]
+	try:
+		vector_count = VectorIndex().ntotal
+	except Exception:
+		vector_count = 0
+	try:
+		llm_response = requests.get(f"{OLLAMA_HOST.rstrip('/')}/api/tags", timeout=2)
+		llm_available = llm_response.ok
+		models = (llm_response.json() or {}).get("models", []) if llm_available else []
+		llm_model_pulled = any(
+			isinstance(model, dict) and (model.get("name") == OLLAMA_MODEL or model.get("model") == OLLAMA_MODEL)
+			for model in models
+		)
+	except (requests.RequestException, ValueError, TypeError):
+		llm_available = False
+		llm_model_pulled = False
+	learner = review_queue.learner_status()
+	sar_status = "CALIBRATED" if sar_supported_candidates else ("PARTIAL" if registered_sar else "UNAVAILABLE")
+	return {"aoi_count": counts["aois"], "scene_count": counts["scenes"], "tile_count": counts["tiles"], "vector_count": vector_count,
+			"candidates_scored": counts["change_candidates"], "candidates_promoted": _count_unsuppressed(),
+			"candidates_confirmed": confirmed, "candidates_suppressed": _count_suppressed(),
+			"discovery_clusters": discovery_clusters, "accelerating_tiles": accelerating_tiles,
+			"sar_supported_candidates": sar_supported_candidates, "sar_status": sar_status,
+			"learner_status": "TRAINED" if learner["trained"] else "COLD START", "learner_examples": learner["n_examples"],
+			"llm_available": llm_available, "llm_model_pulled": llm_model_pulled, "llm_model": OLLAMA_MODEL,
+			"processing_version": db.PROCESSING_VERSION, "last_run": last_run}
+
+
+def _count_suppressed() -> int:
+	with db.get_conn() as conn:
+		return conn.execute("SELECT COUNT(*) FROM change_candidates WHERE suppressed=1").fetchone()[0]
+
+
+def _count_unsuppressed() -> int:
+	with db.get_conn() as conn:
+		return conn.execute("SELECT COUNT(*) FROM change_candidates WHERE suppressed=0").fetchone()[0]
+
+
+def _index_count() -> int:
+	try:
+		return VectorIndex().ntotal
+	except Exception:
+		return 0
+
+
+@app.get("/aois", response_model=list[AOI])
+def aois(request: Request):
+	with db.get_conn() as conn:
+		rows = conn.execute("""SELECT a.*, COUNT(DISTINCT s.scene_path) scene_count, COUNT(DISTINCT t.vector_id) tile_count,
+			MAX(cc.created_at) last_candidate FROM aois a LEFT JOIN scenes s ON s.aoi_id=a.aoi_id
+			LEFT JOIN tiles t ON t.aoi_id=a.aoi_id LEFT JOIN change_candidates cc ON cc.tile_id=t.tile_id GROUP BY a.aoi_id ORDER BY a.name""").fetchall()
+	result = []
+	for row in rows:
+		thumb = _latest_aoi_mosaic(row["aoi_id"], request)
+		result.append({"aoi_id": row["name"], "name": row["name"], "bbox": [row["minlon"], row["minlat"], row["maxlon"], row["maxlat"]],
+					   "start_date": row["first_date"], "end_date": row["last_date"], "scene_count": row["scene_count"], "tile_count": row["tile_count"],
+					   "mosaic_thumbnail_url": thumb, "last_activity": row["last_candidate"] or row["last_date"]})
+	return result
+
+
+@app.get("/aois/{aoi_id}/tiles")
+def aoi_tiles(aoi_id: str, request: Request):
+	aoi = aoi_row(aoi_id)
+	with db.get_conn() as conn:
+		rows = conn.execute(
+			"SELECT tile_id, MIN(acquisition_date) first_observation, MAX(acquisition_date) latest_observation, "
+			"COUNT(*) observation_count FROM tiles WHERE aoi_id=? GROUP BY tile_id ORDER BY tile_id",
+			(aoi["aoi_id"],),
+		).fetchall()
+	items = []
+	for row in rows:
+		history = db.get_tile_history(row["tile_id"])
+		latest = history[-1] if history else None
+		velocity = temporal_signature.compute_velocity(row["tile_id"])
+		thumbnail = _observation_thumbnail_url(request, latest) if latest else None
+		items.append({
+			"tile_id": row["tile_id"], "aoi_id": aoi_id, "aoi_name": aoi["name"],
+			"first_observation": row["first_observation"], "latest_observation": row["latest_observation"],
+			"observation_count": row["observation_count"], "thumbnail_url": thumbnail,
+			"latest_velocity": velocity.latest_velocity, "acceleration": velocity.acceleration, "trend": velocity.trend,
+		})
+	return {"aoi_id": aoi_id, "aoi_name": aoi["name"], "tile_count": len(items), "tiles": items}
+
+
+@app.patch("/aois/{aoi_id}")
+def update_aoi_priority(aoi_id: str, payload: AOIPriorityUpdate):
+	aoi = aoi_row(aoi_id)
+	if payload.priority_tier is not None and payload.priority_tier not in {"low", "medium", "high"}:
+		raise HTTPException(400, "priority_tier must be low, medium, or high")
+	updates = []
+	values = []
+	if payload.priority_tier is not None:
+		updates.append("priority_tier=?")
+		values.append(payload.priority_tier)
+	if payload.priority_geojson is not None:
+		updates.append("priority_geojson=?")
+		values.append(payload.priority_geojson)
+	if updates:
+		with db.get_conn() as conn:
+			conn.execute(f"UPDATE aois SET {', '.join(updates)} WHERE aoi_id=?", (*values, aoi["aoi_id"]))
+	return {"ok": True, "aoi_id": aoi_id}
+
+
+def _latest_aoi_mosaic(aoi_id: int, request: Request) -> str | None:
+	with db.get_conn() as conn:
+		date = conn.execute("SELECT MAX(acquisition_date) FROM tiles WHERE aoi_id=?", (aoi_id,)).fetchone()[0]
+	if not date:
+		return None
+	rows = _mosaic_rows(aoi_id, date)
+	if not rows:
+		return None
+	path, _, _ = mosaic_thumbnail(rows, GENERATED_DIR / "mosaics", f"{aoi_id}-{date[:7]}")
+	return public_url(request, path)
+
+
+def _mosaic_rows(aoi_id: int, date: str) -> list:
+	with db.get_conn() as conn:
+		return conn.execute("SELECT * FROM tiles WHERE aoi_id=? AND acquisition_date LIKE ? ORDER BY row_idx,col_idx", (aoi_id, f"{date[:7]}%" if len(date) > 7 else f"{date}%")).fetchall()
+
+
+@app.get("/aois/{aoi_id}/timeline", response_model=list[TimelineEntry])
+def timeline(aoi_id: str, request: Request):
+	aoi = aoi_row(aoi_id)
+	with db.get_conn() as conn:
+		scenes = conn.execute("SELECT * FROM scenes WHERE aoi_id=? ORDER BY acquisition_date DESC", (aoi["aoi_id"],)).fetchall()
+	output = []
+	for scene in scenes:
+		with db.get_conn() as conn:
+			tile_count = conn.execute("SELECT COUNT(*) FROM tiles WHERE scene_path=?", (scene["scene_path"],)).fetchone()[0]
+		with db.get_conn() as conn:
+			rows = conn.execute("SELECT * FROM tiles WHERE scene_path=? ORDER BY row_idx,col_idx", (scene["scene_path"],)).fetchall()
+		thumb = None
+		if rows:
+			path, _, _ = mosaic_thumbnail(rows, GENERATED_DIR / "mosaics", f"{aoi['aoi_id']}-{scene['scene_path']}")
+			thumb = public_url(request, path)
+		output.append({"date": scene["acquisition_date"], "scene_id": scene_id(aoi_id, scene["acquisition_date"]), "sensor": scene["sensor"],
+					   "cloud_fraction": scene["cloud_cover_percent"] / 100 if scene["cloud_cover_percent"] is not None else None,
+					   "tile_count": tile_count, "acquisition_date_source": scene["acquisition_date_source"], "thumbnail_url": thumb})
+	return output
+
+
+@app.get("/aois/{aoi_id}/mosaic", response_model=Mosaic)
+def mosaic(aoi_id: str, request: Request, date: str = Query(...)):
+	aoi = aoi_row(aoi_id)
+	rows = _mosaic_rows(aoi["aoi_id"], date)
+	if not rows:
+		raise HTTPException(404, "No tiles for that AOI and month")
+	path, width, height = mosaic_thumbnail(rows, GENERATED_DIR / "mosaics", f"{aoi['aoi_id']}-{date[:7]}")
+	changed = _changed_vectors()
+	return {"aoi_id": aoi_id, "date": date, "image_url": public_url(request, path), "width": width, "height": height,
+			"tiles": [{"tile_id": row["tile_id"], "vector_id": row["vector_id"], "x": (row["col_idx"] or 0) * TILE_SIZE_PX,
+					   "y": (row["row_idx"] or 0) * TILE_SIZE_PX, "width": TILE_SIZE_PX, "height": TILE_SIZE_PX,
+					   "cluster_id": row["cluster_id"], "has_change_candidate": row["vector_id"] in changed} for row in rows]}
+
+
+def _changed_vectors() -> set[int]:
+	with db.get_conn() as conn:
+		return {row["vector_id_after"] for row in conn.execute("SELECT vector_id_after FROM change_candidates WHERE suppressed=0")}
+
+
+@app.get("/tiles/{tile_id}/similar", response_model=list[SearchResult])
+def similar(tile_id: str, request: Request, k: int = Query(12, ge=1, le=100)):
+	with db.get_conn() as conn:
+		row = conn.execute("SELECT * FROM tiles WHERE tile_id=? ORDER BY acquisition_date DESC LIMIT 1", (tile_id,)).fetchone()
+	if row is None:
+		raise HTTPException(404, "Tile not found")
+	return [search_public(item, request) for item in index_search.image_search_by_tile(row["tile_path"], top_k=k)]
+
+
+@app.get("/vectors/{vector_id}/similar", response_model=list[SearchResult])
+def similar_vector(vector_id: int, request: Request, k: int = Query(12, ge=1, le=100)):
+	row = db.get_tile(vector_id)
+	if row is None:
+		raise HTTPException(404, "Vector not found")
+	return [search_public(item, request) for item in index_search.image_search_by_tile(row["tile_path"], top_k=k)]
+
+
+@app.get("/tiles/compare", response_model=CompareResult)
+def compare_tiles(before_vector_id: int, after_vector_id: int, request: Request):
+	before = db.get_tile(before_vector_id)
+	after = db.get_tile(after_vector_id)
+	if before is None or after is None:
+		raise HTTPException(404, "Comparison tile not found")
+	if not source_available(before["tile_path"]) or not source_available(after["tile_path"]):
+		return {"difference_image_url": None}
+	difference_path, _, _, _, _ = difference_image(
+		before["tile_path"], after["tile_path"], GENERATED_DIR / "differences",
+		f"search-{before_vector_id}-{after_vector_id}",
+	)
+	return {"difference_image_url": public_url(request, difference_path)}
+
+
+@app.get("/tiles/{tile_id}", response_model=TileDetail)
+def tile(tile_id: str, request: Request):
+	with db.get_conn() as conn:
+		row = conn.execute("SELECT * FROM tiles WHERE tile_id=? ORDER BY acquisition_date DESC LIMIT 1", (tile_id,)).fetchone()
+	if row is None:
+		raise HTTPException(404, "Tile not found")
+	return tile_public(row, request)
+
+
+@app.get("/tiles/{tile_id}/observations")
+def tile_observations(tile_id: str, request: Request):
+	history = db.get_tile_history(tile_id)
+	if not history:
+		raise HTTPException(404, "Tile not found")
+	output = []
+	with db.get_conn() as conn:
+		sar_rows = conn.execute("SELECT * FROM sar_tiles WHERE tile_id=? ORDER BY acquisition_datetime, period_start", (tile_id,)).fetchall()
+	for row in history:
+		aoi_id = _row_value(row, "aoi_id")
+		aoi = db.get_aoi(aoi_id) if aoi_id is not None else None
+		sar_match = _sar_observation_for_date(tile_id, row["acquisition_date"])
+		output.append({
+			"observation_id": row["vector_id"], "vector_id": row["vector_id"],
+			"tile_id": row["tile_id"],
+			"acquisition_date": row["acquisition_date"], "acquisition_datetime": None,
+			"image_url": _observation_thumbnail_url(request, row),
+			"thumbnail_url": _observation_thumbnail_url(request, row),
+			"scene_id": scene_id(aoi["name"] if aoi else str(aoi_id), row["acquisition_date"]),
+			"sensor": row["sensor"],
+			"cloud_fraction": row["cloud_fraction"], "valid_pixel_fraction": row["valid_pixel_fraction"],
+			"ndvi_mean": row["ndvi_mean"], "ndwi_mean": row["ndwi_mean"],
+			"has_sar": bool(sar_match),
+			"sar_observation_id": sar_match["sar_tile_id"] if sar_match else None,
+			"sar_acquisition_datetime": sar_match["acquisition_datetime"] if sar_match else None,
+			"sar_visual_count": 4 if sar_match and sar_match["tile_path"] and Path(sar_match["tile_path"]).exists() else 0,
+		})
+	return {"tile_id": tile_id, "observations": output}
+
+
+@app.get("/tiles/{tile_id}/analysis")
+def tile_analysis(tile_id: str, request: Request, before: str | None = Query(None), after: str | None = Query(None), from_date: str | None = Query(None), to_date: str | None = Query(None)):
+	history = db.get_tile_history(tile_id)
+	if not history:
+		raise HTTPException(404, "Tile not found")
+	resolved_from = _normalize_date(from_date or before) or history[0]["acquisition_date"]
+	resolved_to = _normalize_date(to_date or after) or history[-1]["acquisition_date"]
+	by_date = {row["acquisition_date"]: row for row in history}
+	if resolved_from not in by_date or resolved_to not in by_date:
+		raise HTTPException(422, "from_date and to_date must be actual observations for this tile")
+	if resolved_from >= resolved_to:
+		raise HTTPException(422, "from_date must be earlier than to_date")
+	filtered_history = [row for row in history if resolved_from <= row["acquisition_date"] <= resolved_to]
+	velocity = temporal_signature.compute_velocity(tile_id)
+	series = velocity.series
+	selected_series = []
+	if series:
+		for item in series:
+			before = item.get("date_pair", {}).get("before")
+			after = item.get("date_pair", {}).get("after")
+			if before and after and resolved_from and resolved_to:
+				if resolved_from <= before <= resolved_to or resolved_from <= after <= resolved_to:
+					selected_series.append(item)
+		if not selected_series:
+			selected_series = series
+	obs_out = []
+	for row in filtered_history:
+		aoi_id = _row_value(row, "aoi_id")
+		aoi = db.get_aoi(aoi_id) if aoi_id is not None else None
+		obs_out.append({
+			"date": row["acquisition_date"],
+			"source": row["sensor"] or "SENTINEL2",
+			"sensor": row["sensor"],
+			"thumbnail_url": _observation_thumbnail_url(request, row),
+			"quality": "ok" if (row["cloud_fraction"] is None or row["cloud_fraction"] <= 0.25) else "cloud-degraded",
+			"score": row["ndvi_mean"],
+			"note": None,
+		})
+	before_row = filtered_history[0] if filtered_history else history[0]
+	after_row = filtered_history[-1] if filtered_history else history[-1]
+	numeric_values = [float(row["ndvi_mean"]) for row in filtered_history if _row_value(row, "ndvi_mean") is not None]
+	numeric_water = [float(row["ndwi_mean"]) for row in filtered_history if _row_value(row, "ndwi_mean") is not None]
+	before_ndvi = _row_value(before_row, "ndvi_mean"); after_ndvi = _row_value(after_row, "ndvi_mean")
+	before_ndwi = _row_value(before_row, "ndwi_mean"); after_ndwi = _row_value(after_row, "ndwi_mean")
+	metrics = {
+		"ndvi_delta": (after_ndvi - before_ndvi) if before_ndvi is not None and after_ndvi is not None else None,
+		"ndwi_delta": (after_ndwi - before_ndwi) if before_ndwi is not None and after_ndwi is not None else None,
+		"velocity": velocity.latest_velocity,
+		"acceleration": velocity.acceleration,
+		"drift": (after_ndvi - before_ndvi) if before_ndvi is not None and after_ndvi is not None else None,
+	}
+	sar_pair = find_matching_sar_pair(before_row, after_row)
+	if sar_pair:
+		metrics["sar_change"] = sar.sar_change_score(*sar_pair)
+		metrics["sar_vv_delta"] = (sar_pair[1].vv_mean_db - sar_pair[0].vv_mean_db) if sar_pair[0].vv_mean_db is not None and sar_pair[1].vv_mean_db is not None else None
+		metrics["sar_vh_delta"] = (sar_pair[1].vh_mean_db - sar_pair[0].vh_mean_db) if sar_pair[0].vh_mean_db is not None and sar_pair[1].vh_mean_db is not None else None
+	else:
+		metrics["sar_change"] = metrics["sar_vv_delta"] = metrics["sar_vh_delta"] = None
+	try:
+		overall_pair = analyze_tile_pair(history[0], history[-1], sar_pair=find_matching_sar_pair(history[0], history[-1]))
+		overall_score = overall_pair.combined_score
+	except (OSError, ValueError, IndexError, KeyError):
+		overall_score = None
+	overall_days = max((datetime.fromisoformat(history[-1]["acquisition_date"]) - datetime.fromisoformat(history[0]["acquisition_date"])).days, 1)
+	metrics["overall_change_score"] = overall_score
+	metrics["overall_velocity"] = overall_score / overall_days if overall_score is not None else None
+	optical = {
+		"dates": [row["acquisition_date"] for row in filtered_history],
+		"ndvi": [row["ndvi_mean"] for row in filtered_history],
+		"ndwi": [row["ndwi_mean"] for row in filtered_history],
+		"cloud_fraction": [row["cloud_fraction"] for row in filtered_history],
+	}
+	with db.get_conn() as conn:
+		sar_rows = conn.execute("SELECT * FROM sar_tiles WHERE tile_id=? ORDER BY acquisition_datetime, period_start", (tile_id,)).fetchall()
+	selected_sar = [
+		dict(row) for row in sar_rows
+		if (resolved_from is None or (row["acquisition_datetime"] or row["period_start"] or row["period_end"] or "")[:10] >= resolved_from)
+		and (resolved_to is None or (row["acquisition_datetime"] or row["period_start"] or row["period_end"] or "")[:10] <= resolved_to)
+	]
+	sar_values = {
+		"dates": [(row["acquisition_datetime"] or row["period_start"] or row["period_end"] or "")[:10] for row in selected_sar],
+		"timestamps": [row["acquisition_datetime"] for row in selected_sar],
+		"vv_mean": [row["vv_mean_db"] for row in selected_sar],
+		"vh_mean": [row["vh_mean_db"] for row in selected_sar],
+		"vv_minus_vh": [row["vv_minus_vh_db"] for row in selected_sar],
+		"vv_std": [row["vv_std_db"] for row in selected_sar],
+		"vh_std": [row["vh_std_db"] for row in selected_sar],
+		"valid_fraction": [row["valid_pixels"] for row in selected_sar],
+	}
+	spatial_layers = {"difference_heatmap_url": None, "backend_difference_mask_url": None, "ndvi_delta_url": None, "ndwi_delta_url": None, "ndbi_delta_url": None, "ndmi_delta_url": None, "nbr_delta_url": None, "mndwi_delta_url": None, "sar_delta_url": None}
+	if source_available(before_row["tile_path"]) and source_available(after_row["tile_path"]):
+		mask_path, _, _, _, _ = difference_image(before_row["tile_path"], after_row["tile_path"], GENERATED_DIR / "differences", f"{tile_id}-{before_row['vector_id']}-{after_row['vector_id']}")
+		spatial_layers["backend_difference_mask_url"] = public_url(request, mask_path)
+		heatmap_path = heatmap.spectral_diff_heatmap(before_row["tile_path"], after_row["tile_path"])
+		if heatmap_path:
+			spatial_layers["difference_heatmap_url"] = public_url(request, DATA_DIR.parent / heatmap_path)
+	if metrics["sar_change"] is not None:
+		spatial_layers["sar_delta_url"] = None
+	response = {
+		"tile_id": tile_id,
+		"aoi_id": history[0]["aoi_id"],
+		"range": {
+			"from": resolved_from,
+			"to": resolved_to,
+			"label": f"{resolved_from} → {resolved_to}",
+			"days": (datetime.fromisoformat(resolved_to) - datetime.fromisoformat(resolved_from)).days if resolved_from and resolved_to else None,
+		},
+		"before": {"date": before_row["acquisition_date"], "image_url": _observation_thumbnail_url(request, before_row), "sensor": before_row["sensor"], "quality": before_row["cloud_fraction"]},
+		"after": {"date": after_row["acquisition_date"], "image_url": _observation_thumbnail_url(request, after_row), "sensor": after_row["sensor"], "quality": after_row["cloud_fraction"]},
+		"velocity": velocity,
+		"optical": optical,
+		"sar": sar_values,
+		"fusion": {"optical": optical, "sar": sar_values},
+		"events": [{"date": row["acquisition_date"], "label": "observation", "severity": "low", "detail": f"{row['sensor'] or 'optical'} acquisition"} for row in filtered_history[:5]],
+		"metrics": metrics,
+		"quality": {"range_applied": bool(from_date or to_date), "observations_used": len(filtered_history), "sar_available": bool(selected_sar)},
+		"visuals": {"before": {"date": before_row["acquisition_date"], "image_url": _observation_thumbnail_url(request, before_row)}, "after": {"date": after_row["acquisition_date"], "image_url": _observation_thumbnail_url(request, after_row)}},
+		"observations": obs_out,
+		"range_label": f"{resolved_from} → {resolved_to}",
+		"sar_observations": selected_sar,
+		"series": selected_series,
+		"spatial_layers": spatial_layers,
+	}
+	response["indices"] = [
+		{"name": "NDVI", "before": before_row["ndvi_mean"], "after": after_row["ndvi_mean"], "delta": metrics["ndvi_delta"], "available": before_row["ndvi_mean"] is not None and after_row["ndvi_mean"] is not None},
+		{"name": "NDWI", "before": before_row["ndwi_mean"], "after": after_row["ndwi_mean"], "delta": metrics["ndwi_delta"], "available": before_row["ndwi_mean"] is not None and after_row["ndwi_mean"] is not None},
+	]
+	before_sar = _sar_observation_for_date(tile_id, resolved_from)
+	after_sar = _sar_observation_for_date(tile_id, resolved_to)
+	response["sar_evidence"] = {"available": bool(before_sar and after_sar), "before": _sar_public(before_sar, request), "after": _sar_public(after_sar, request)}
+	return response
+
+
+@app.get("/tiles/{tile_id}/analysis/series")
+def tile_analysis_series(tile_id: str):
+	history = db.get_tile_history(tile_id)
+	if not history:
+		raise HTTPException(404, "Tile not found")
+	velocity = temporal_signature.compute_velocity(tile_id)
+	with db.get_conn() as conn:
+		sar_rows = conn.execute("SELECT * FROM sar_tiles WHERE tile_id=? ORDER BY acquisition_datetime, period_start", (tile_id,)).fetchall()
+	return {
+		"tile_id": tile_id,
+		"coverage": {"first_date": history[0]["acquisition_date"], "latest_date": history[-1]["acquisition_date"], "observation_count": len(history), "sar_observation_count": len(sar_rows)},
+		"velocity_series": [{"date": item["date_pair"]["after"], "before": item["date_pair"]["before"], "after": item["date_pair"]["after"], "velocity": item["velocity"], "change_score": item["velocity"] * max((datetime.fromisoformat(item["date_pair"]["after"]) - datetime.fromisoformat(item["date_pair"]["before"])).days, 1), "source": item["source"]} for item in velocity.series],
+		"optical_series": {name: [{"date": row["acquisition_date"], "value": row[column]} for row in history if row[column] is not None] for name, column in (("ndvi", "ndvi_mean"), ("ndwi", "ndwi_mean"))},
+		"sar_series": {
+			"vv": [{"date": (row["acquisition_datetime"] or row["period_start"] or row["period_end"])[:10], "datetime": row["acquisition_datetime"], "value_db": row["vv_mean_db"], "observation_id": row["sar_tile_id"]} for row in sar_rows if row["vv_mean_db"] is not None],
+			"vh": [{"date": (row["acquisition_datetime"] or row["period_start"] or row["period_end"])[:10], "datetime": row["acquisition_datetime"], "value_db": row["vh_mean_db"], "observation_id": row["sar_tile_id"]} for row in sar_rows if row["vh_mean_db"] is not None],
+			"vv_minus_vh": [{"date": (row["acquisition_datetime"] or row["period_start"] or row["period_end"])[:10], "datetime": row["acquisition_datetime"], "value_db": row["vv_minus_vh_db"], "observation_id": row["sar_tile_id"]} for row in sar_rows if row["vv_minus_vh_db"] is not None],
+			"change_score": [], "valid_fraction": [{"date": (row["acquisition_datetime"] or row["period_start"] or row["period_end"])[:10], "datetime": row["acquisition_datetime"], "value": row["valid_pixels"], "observation_id": row["sar_tile_id"]} for row in sar_rows if row["valid_pixels"] is not None],
+		},
+		"fusion_series": {"change_score": [], "embedding_drift": []},
+	}
+
+
+@app.get("/changes/velocity")
+def change_velocity(limit: int = Query(8, ge=1, le=48), offset: int = Query(0, ge=0), include_series: bool = Query(True)):
+	results = temporal_signature.velocity_for_all_tiles()
+	trend_order = {"accelerating": 0, "steady_change": 1, "decelerating": 2, "stable": 3}
+	ordered = sorted(results.items(), key=lambda item: trend_order.get(item[1].trend, 4))
+	page = ordered[offset:offset + limit]
+	return [
+		{
+			"tile_id": tile_id,
+			"first_observation": (db.get_tile_history(tile_id)[0]["acquisition_date"] if db.get_tile_history(tile_id) else None),
+			"latest_observation": (db.get_tile_history(tile_id)[-1]["acquisition_date"] if db.get_tile_history(tile_id) else None),
+			"trend": result.trend,
+			"latest_velocity": result.latest_velocity,
+			"acceleration": result.acceleration,
+			"series": result.series[:6] if include_series else [],
+			"velocities": result.velocities,
+		}
+		for tile_id, result in page
+	]
+
+
+@app.get("/tiles/{tile_id}/temporal-signature")
+def temporal_signature_detail(tile_id: str, range_days: int | None = Query(None, ge=1, le=3650)):
+	if not db.get_tile_history(tile_id):
+		raise HTTPException(404, "Tile not found")
+	result = temporal_signature.compute_velocity(tile_id)
+	series = result.series
+	velocities = result.velocities
+	if range_days is not None and series:
+		date_values = [item.get("date_pair", {}).get("after") for item in series]
+		parsed_dates = [datetime.fromisoformat(value) for value in date_values if value]
+		if parsed_dates:
+			cutoff = max(parsed_dates) - timedelta(days=range_days)
+			selected = [
+				(index, item)
+				for index, item in enumerate(series)
+				if item.get("date_pair", {}).get("after") and datetime.fromisoformat(item["date_pair"]["after"]) >= cutoff
+			]
+			series = [item for _, item in selected]
+			velocities = [velocities[index] for index, _ in selected]
+	return {
+		"series": series,
+		"velocities": velocities,
+		"score_sources": result.score_sources[-len(series):] if series else [],
+		"acceleration": result.acceleration,
+		"trend": result.trend,
+		"latest_velocity": result.latest_velocity,
+	}
+
+
+@app.get("/tiles/{tile_id}/temporal-evolution")
+def temporal_evolution(tile_id: str, request: Request):
+	history = db.get_tile_history(tile_id)
+	if not history:
+		raise HTTPException(404, "Tile not found")
+	velocity = temporal_signature.compute_velocity(tile_id)
+	profile = temporal_signature.temporal_profile(tile_id)
+	frames = []
+	score_sources = getattr(velocity, "score_sources", ["combined"] * max(1, len(velocity.velocities or [0])))
+	for idx, selected in enumerate(temporal_signature.select_temporal_keyframes(history)):
+		stage = temporal_signature._stage_label(idx, min(5, len(history)))
+		aoi_id = _obj_value(selected, "aoi_id")
+		aoi = db.get_aoi(aoi_id) if aoi_id is not None else None
+		date_value = _obj_value(selected, "date") or _obj_value(selected, "acquisition_date")
+		path = _obj_value(selected, "tile_path")
+		vector_id = _obj_value(selected, "vector_id")
+		thumb = None
+		if path and vector_id is not None and Path(path).exists():
+			thumb = public_url(request, tile_thumbnail(path, GENERATED_DIR / "thumbnails", int(vector_id)))
+		quality = "ok"
+		cloud_fraction = _obj_value(selected, "cloud_fraction")
+		if cloud_fraction is not None and float(cloud_fraction) > 0.25:
+			quality = "cloud-degraded"
+		frame = {
+			"date": date_value,
+			"sensor": _obj_value(selected, "sensor") or "SENTINEL2",
+			"image_url": thumb,
+			"thumbnail_url": thumb,
+			"stage": stage,
+			"score": float(velocity.velocities[min(idx, len(velocity.velocities) - 1)]) if velocity.velocities else None,
+			"score_source": score_sources[min(idx, len(score_sources) - 1)] if score_sources else "combined",
+			"quality": quality,
+			"selected": idx == max(0, min(len(history) - 1, len(history) // 2)),
+			"asset_tile_id": _obj_value(selected, "tile_id"),
+			"asset_aoi_id": aoi["name"] if aoi else _obj_value(selected, "aoi_id"),
+			"location": aoi["name"] if aoi else None,
+		}
+		frames.append(frame)
+	return {
+		"tile_id": tile_id,
+		"aoi_id": history[0]["aoi_id"] if history and history[0]["aoi_id"] is not None else None,
+		"location": db.get_aoi(history[0]["aoi_id"])['name'] if history and history[0]["aoi_id"] is not None and db.get_aoi(history[0]["aoi_id"]) else None,
+		"trend": velocity.trend,
+		"velocity": velocity.latest_velocity,
+		"acceleration": velocity.acceleration,
+		"storyline": storyline.classify_stage(velocity.velocities, profile) if velocity.velocities else None,
+		"frames": frames,
+	}
+
+
+@app.get("/tiles/{tile_id}/storyline")
+def tile_storyline(tile_id: str):
+	if not db.get_tile_history(tile_id):
+		raise HTTPException(404, "Tile not found")
+	velocity = temporal_signature.compute_velocity(tile_id)
+	profile = temporal_signature.temporal_profile(tile_id)
+	return {
+		"profile": profile,
+		"velocities": velocity.velocities,
+		"stage": storyline.classify_stage(velocity.velocities, profile),
+	}
+
+
+@app.get("/system/llm-status")
+def system_llm_status():
+	from backend.app.config import OLLAMA_HOST, OLLAMA_MODEL
+	available = False
+	model_pulled = False
+	try:
+		response = requests.get(f"{OLLAMA_HOST.rstrip('/')}/api/tags", timeout=2)
+		available = response.ok
+		if response.ok:
+			try:
+				payload = response.json() or {}
+				models = payload.get("models") or payload.get("data") or []
+				names = []
+				for item in models:
+					if isinstance(item, dict):
+						name = item.get("name") or item.get("model") or item.get("model_name")
+						if isinstance(name, str):
+							names.append(name)
+					elif isinstance(item, str):
+						names.append(item)
+				model_pulled = any(name == OLLAMA_MODEL or name.startswith(f"{OLLAMA_MODEL}:") for name in names)
+			except (TypeError, ValueError):
+				model_pulled = False
+	except requests.RequestException:
+		available = False
+		model_pulled = False
+	return {"available": available, "model_pulled": model_pulled}
+
+
+@app.post("/tiles/{tile_id}/analysis/brief")
+def tile_analysis_brief(tile_id: str, request: Request, payload: dict):
+	from backend.app.change.llm_brief import generate_llm_brief
+	def rounded(value, digits=4):
+		return round(float(value), digits) if isinstance(value, (int, float)) else value
+
+	before_date = payload.get("before_date")
+	after_date = payload.get("after_date")
+	analysis = tile_analysis(tile_id, request, from_date=before_date, to_date=after_date)
+	metrics = analysis["metrics"]
+	facts = {
+		"tile_id": tile_id, "aoi_id": analysis.get("aoi_id"),
+		"from_date": analysis["range"]["from"], "to_date": analysis["range"]["to"],
+		"separation_days": analysis["range"]["days"], "change_score": rounded(metrics.get("overall_change_score")),
+		"velocity": rounded(metrics.get("velocity"), 5), "acceleration": rounded(metrics.get("acceleration"), 7),
+		"trend": getattr(analysis.get("velocity"), "trend", None),
+		"ndvi_delta": rounded(metrics.get("ndvi_delta")), "ndwi_delta": rounded(metrics.get("ndwi_delta")),
+		"sar_change": rounded(metrics.get("sar_change")), "sar_vv_delta": rounded(metrics.get("sar_vv_delta")),
+		"sar_vh_delta": rounded(metrics.get("sar_vh_delta")), "sar_available": analysis["quality"].get("sar_available"),
+		"observations_used": analysis["quality"].get("observations_used"), "modality": "optical and SAR temporal evidence" if analysis["quality"].get("sar_available") else "optical temporal evidence",
+	}
+	llm_text = generate_llm_brief(facts)
+	brief_text = llm_text
+	if not brief_text:
+		parts = [f"Observed change was measured between {facts['from_date']} and {facts['to_date']}."]
+		for label, key in (("NDVI", "ndvi_delta"), ("NDWI", "ndwi_delta"), ("SAR change", "sar_change")):
+			value = facts.get(key)
+			if value is not None:
+				parts.append(f"{label} changed by {float(value):.3f}.")
+		if not facts["sar_available"]:
+			parts.append("Sentinel-1 evidence was unavailable for the selected interval.")
+		brief_text = " ".join(parts)
+	return {"available": llm_text is not None, "brief": brief_text, "facts": facts}
+
+
+@app.post("/preview/image")
+async def preview_image(file: Annotated[UploadFile, File(...)]):
+	try:
+		image = Image.open(io.BytesIO(await file.read())).convert("RGB")
+		buffer = io.BytesIO()
+		image.thumbnail((512, 512))
+		image.save(buffer, format="PNG")
+	except (OSError, ValueError) as error:
+		raise HTTPException(400, "Uploaded file is not a readable image") from error
+	return Response(content=buffer.getvalue(), media_type="image/png")
+
+
+@app.post("/search/text", response_model=list[SearchResult])
+def text_search(payload: TextSearchRequest, request: Request):
+	date_from = payload.date_from or payload.date
+	date_to = payload.date_to or payload.date
+	aoi_id = payload.aoi_id
+	sensor = None
+	resolved_aoi_id = None
+	if aoi_id:
+		resolved_aoi_id = aoi_row(aoi_id)["aoi_id"]
+	try:
+		results = index_search.text_search(
+			payload.query,
+			top_k=payload.k,
+			date_from=date_from,
+			date_to=date_to,
+			sensor=sensor,
+			aoi_id=resolved_aoi_id,
+		)
+	except RuntimeError as error:
+		raise HTTPException(503, f"Semantic search unavailable: {error}") from error
+	return [search_public(item, request) for item in results]
+
+
+@app.post("/search/image", response_model=list[SearchResult])
+async def image_search(request: Request, file: Annotated[UploadFile, File(...)], aoi_id: Annotated[str | None, Form()] = None, k: Annotated[int, Form(ge=1, le=100)] = 12):
+	try:
+		image = Image.open(io.BytesIO(await file.read())).convert("RGB")
+	except (OSError, ValueError) as error:
+		raise HTTPException(400, "Uploaded file is not a readable image") from error
+	resolved_aoi_id = aoi_row(aoi_id)["aoi_id"] if aoi_id else None
+	try:
+		results = index_search.image_search_by_upload(image, top_k=k, aoi_id=resolved_aoi_id)
+	except RuntimeError as error:
+		raise HTTPException(503, f"Semantic search unavailable: {error}") from error
+	return [search_public(item, request) for item in results]
+
+
+@app.get("/changes/candidates", response_model=list[ChangeCandidate])
+def candidates(request: Request, status: str | None = None, aoi_id: str | None = None,
+			   sort: str = Query("combined_score"), min_priority: float | None = Query(None, ge=0, le=1),
+			   modality: str | None = None, limit: int = Query(24, ge=1, le=100), offset: int = Query(0, ge=0)):
+	decisions = latest_decisions()
+	with db.get_conn() as conn:
+		join = " JOIN tiles t ON t.tile_id = cc.tile_id AND t.vector_id = cc.vector_id_after" if aoi_id else ""
+		clauses = ["t.aoi_id = ?"] if aoi_id else []
+		params = (aoi_row(aoi_id)["aoi_id"],) if aoi_id else ()
+		if min_priority is not None:
+			clauses.append("COALESCE(cc.priority_score, 0) >= ?")
+			params += (min_priority,)
+		if modality:
+			clauses.append("cc.modality = ?")
+			params += (modality,)
+		if status and status.upper() == "SUPPRESSED":
+			clauses.append("cc.suppressed = 1")
+		elif status:
+			clauses.append("cc.suppressed = 0")
+		where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+		order_column = {"priority": "COALESCE(cc.priority_score, 0)", "learned": "COALESCE(cc.predicted_confirm_prob, 0)", "combined_score": "cc.combined_score"}.get(sort, "cc.combined_score")
+		# Status is derived from suppression and the latest review decision, so
+		# filter it before pagination or SUPPRESSED pages can never be filled.
+		if status:
+			rows = [
+				row for row in conn.execute(
+					f"SELECT cc.* FROM change_candidates cc{join}{where} ORDER BY {order_column} DESC",
+					params,
+				).fetchall()
+				if candidate_status(row, decisions) == status.upper()
+			]
+			rows = rows[offset:offset + limit]
+		else:
+			params += (limit, offset)
+			rows = conn.execute(
+				f"SELECT cc.* FROM change_candidates cc{join}{where} ORDER BY {order_column} DESC LIMIT ? OFFSET ?",
+				params,
+			).fetchall()
+	items = [candidate_public(row, request, decisions) for row in rows]
+	return items
+
+
+@app.post("/changes/recompute-priority")
+def recompute_priority():
+	from backend.app.change.priority import compute_priority
+	updated = 0
+	with db.get_conn() as conn:
+		rows = conn.execute("SELECT cc.*, t.minlat, t.maxlat, t.minlon, t.maxlon, a.* FROM change_candidates cc JOIN tiles t ON t.vector_id=cc.vector_id_after LEFT JOIN aois a ON a.aoi_id=t.aoi_id").fetchall()
+		hotspots = [dict(row) for row in conn.execute("SELECT cc.*, t.minlat, t.maxlat, t.minlon, t.maxlon FROM change_candidates cc JOIN tiles t ON t.vector_id=cc.vector_id_after JOIN audit_log al ON al.candidate_id=cc.candidate_id WHERE lower(al.analyst_decision)='confirm'").fetchall()]
+		for row in rows:
+			score, reasons = compute_priority(row, row, hotspots)
+			conn.execute("UPDATE change_candidates SET priority_score=?, priority_reasons=? WHERE candidate_id=?", (score, json.dumps(reasons), row["candidate_id"]))
+			updated += 1
+	return {"updated": updated}
+
+
+@app.get("/changes/candidates/data-quality", response_model=ReviewQuality)
+def candidate_review_quality():
+	global QUALITY_CACHE
+	now = time.monotonic()
+	with JOB_LOCK:
+		if QUALITY_CACHE and now - QUALITY_CACHE[0] < QUALITY_CACHE_TTL:
+			return QUALITY_CACHE[1]
+	with db.get_conn() as conn:
+		total = conn.execute("SELECT COUNT(*) FROM change_candidates").fetchone()[0]
+		displayable = conn.execute("SELECT COUNT(*) FROM change_candidates WHERE suppressed=0").fetchone()[0]
+		cloud = conn.execute("SELECT COUNT(*) FROM change_candidates WHERE suppression_reason LIKE 'cloud_fraction_too_high_%'").fetchone()[0]
+		snow = conn.execute("SELECT COUNT(*) FROM change_candidates WHERE suppression_reason LIKE 'snow_cover_too_high_%'").fetchone()[0]
+		pixel = conn.execute("SELECT COUNT(*) FROM change_candidates WHERE suppression_reason LIKE 'insufficient_valid_pixels_%'").fetchone()[0]
+		seasonal = conn.execute("SELECT COUNT(*) FROM change_candidates WHERE suppression_reason LIKE 'likely_seasonal_water_variation_%'").fetchone()[0]
+		threshold = conn.execute("SELECT COUNT(*) FROM change_candidates WHERE suppression_reason LIKE 'below_threshold_%'").fetchone()[0]
+		other = conn.execute("""SELECT COUNT(*) FROM change_candidates
+			WHERE suppressed=1 AND COALESCE(suppression_reason, '') NOT LIKE 'cloud_fraction_too_high_%'
+			AND COALESCE(suppression_reason, '') NOT LIKE 'snow_cover_too_high_%'
+			AND COALESCE(suppression_reason, '') NOT LIKE 'insufficient_valid_pixels_%'
+			AND COALESCE(suppression_reason, '') NOT LIKE 'likely_seasonal_water_variation_%'
+			AND COALESCE(suppression_reason, '') NOT LIKE 'below_threshold_%'
+			AND COALESCE(suppression_reason, '') NOT LIKE 'haze_score_too_high_%'
+			AND COALESCE(suppression_reason, '') NOT LIKE '%source_imagery_unavailable%'
+			""").fetchone()[0]
+		source_unavailable = 0
+		for row in conn.execute("SELECT vector_id_before, vector_id_after FROM change_candidates").fetchall():
+			before = db.get_tile(row["vector_id_before"])
+			after = db.get_tile(row["vector_id_after"])
+			if before is None or after is None:
+				source_unavailable += 1
+				continue
+			if not source_available(before["tile_path"]) or not source_available(after["tile_path"]):
+				source_unavailable += 1
+	result = {
+		"total_candidates": total,
+		"displayable_candidates": displayable,
+		"cloud_suppressed": cloud,
+		"snow_suppressed": snow,
+		"pixel_quality_suppressed": pixel,
+		"seasonal_suppressed": seasonal,
+		"below_threshold_suppressed": threshold,
+		"other_quality_suppressed": other,
+		"source_imagery_unavailable": source_unavailable,
+	}
+	with JOB_LOCK:
+		QUALITY_CACHE = (time.monotonic(), result)
+	return result
+
+
+@app.get("/changes/priority")
+def priority_changes_early(limit: int = Query(24, ge=1, le=200), aoi_id: str | None = None):
+	with db.get_conn() as conn:
+		rows = conn.execute("SELECT cc.* FROM change_candidates cc JOIN tiles t ON t.vector_id=cc.vector_id_after "
+			"WHERE cc.suppressed=0 AND (? IS NULL OR t.aoi_id=?) ORDER BY COALESCE(cc.priority_score, cc.combined_score) DESC LIMIT ?",
+			(aoi_id, aoi_id, limit)).fetchall()
+	return [dict(row) for row in rows]
+
+
+@app.get("/changes/{vector_id}", response_model=ChangeDetail)
+def change(vector_id: int, request: Request):
+	with db.get_conn() as conn:
+		row = conn.execute("SELECT * FROM change_candidates WHERE vector_id_after=? LIMIT 1", (vector_id,)).fetchone()
+	if row is None:
+		raise HTTPException(404, "Change not found")
+	decisions = latest_decisions()
+	result = candidate_public(row, request, decisions)
+	before = db.get_tile(row["vector_id_before"])
+	after = db.get_tile(row["vector_id_after"])
+	history = db.get_tile_history(row["tile_id"])
+	difference_url = None
+	change_region = None
+	changed_fraction = 0.0
+	centroid_x = None
+	centroid_y = None
+	if before and after and Path(before["tile_path"]).exists() and Path(after["tile_path"]).exists() and result["before_thumbnail_url"] and result["after_thumbnail_url"]:
+		difference_path, changed_fraction, change_region, centroid_x, centroid_y = difference_image(
+			before["tile_path"], after["tile_path"], GENERATED_DIR / "differences", f"{before['vector_id']}-{after['vector_id']}"
+		)
+		difference_url = public_url(request, difference_path)
+		with db.get_conn() as conn:
+			conn.execute(
+				"UPDATE change_candidates SET changed_fraction=?, pixel_diff_score=?, change_region=?, change_centroid_x=?, change_centroid_y=? WHERE candidate_id=?",
+				(changed_fraction, changed_fraction, change_region, centroid_x, centroid_y, row["candidate_id"]),
+			)
+		from backend.app.change.heatmap import spectral_diff_heatmap
+		heatmap_path = row["heatmap_spectral"] or spectral_diff_heatmap(before["tile_path"], after["tile_path"])
+		if heatmap_path and not row["heatmap_spectral"]:
+			with db.get_conn() as conn:
+				conn.execute("UPDATE change_candidates SET heatmap_spectral=? WHERE candidate_id=?", (heatmap_path, row["candidate_id"]))
+			result["heatmap_spectral_url"] = public_url(request, ROOT / heatmap_path)
+	ndvi_change = None
+	if before["ndvi_mean"] is not None and after["ndvi_mean"] is not None:
+		ndvi_change = after["ndvi_mean"] - before["ndvi_mean"]
+	quality_notes = _quality_notes(before, after)
+	sar_evidence = None
+	sar_pair = find_matching_sar_pair(before, after) if before and after else None
+	if sar_pair:
+		with db.get_conn() as conn:
+			sar_rows = conn.execute("SELECT * FROM sar_tiles WHERE tile_id=? ORDER BY acquisition_datetime", (row["tile_id"],)).fetchall()
+			sar_evidence = {
+				"sensor": "Sentinel-1",
+				"product_type": "GRD",
+				"backscatter_coefficient": "gamma0",
+				"before": {"vv_db": sar_pair[0].vv_mean_db, "vh_db": sar_pair[0].vh_mean_db, "vv_minus_vh_db": sar_pair[0].vv_minus_vh_db, "valid_fraction": sar_pair[0].valid_pixels},
+				"after": {"vv_db": sar_pair[1].vv_mean_db, "vh_db": sar_pair[1].vh_mean_db, "vv_minus_vh_db": sar_pair[1].vv_minus_vh_db, "valid_fraction": sar_pair[1].valid_pixels},
+				"sar_score": row["sar_score"],
+				"fusion_mode": row["modality"],
+				"sar_quality": "sufficient" if all(item.valid_pixels >= 0.50 for item in sar_pair) else "insufficient",
+				"temporal_match": True,
+				"observations": [{"acquisition_datetime": item["acquisition_datetime"], "period_start": item["period_start"], "period_end": item["period_end"], "processing_version": item["processing_version"]} for item in sar_rows],
+			}
+	source_unavailable = not result["before_source_available"] or not result["after_source_available"]
+	if source_unavailable:
+		visual_summary = "Source imagery for the BEFORE or AFTER observation is unavailable or invalid, so a visual before/after comparison cannot be established."
+	elif ndvi_change is None:
+		visual_summary = "Significant spectral/visual change detected, but change type is uncertain."
+	else:
+		visual_summary = f"NDVI changed from {before['ndvi_mean']:.2f} to {after['ndvi_mean']:.2f}; spectral/visual difference covers {changed_fraction:.1%} of valid pixels."
+	interpretation = "Significant spectral/visual change detected, but change type is uncertain."
+	if row["change_type"]:
+		confidence = row["change_type_confidence"]
+		interpretation = f"Candidate interpretation: {row['change_type']}" + (f" - confidence {confidence:.0%}." if confidence is not None else ".")
+	else:
+		confidence = None
+	result.update({"before_image_url": result["before_thumbnail_url"], "after_image_url": result["after_thumbnail_url"],
+				   "lat": (after["minlat"] + after["maxlat"]) / 2, "lon": (after["minlon"] + after["maxlon"]) / 2,
+				   "bbox": tile_bbox(after), "ndvi_series": [{"date": item["acquisition_date"], "ndvi_mean": item["ndvi_mean"], "ndwi_mean": item["ndwi_mean"], "cloud_fraction": item["cloud_fraction"]} for item in history],
+																		 "quality_notes": quality_notes,
+																	 "acquisition_date_source": scene_source(after["scene_path"]), "processing_version": after["processing_version"], "sar_evidence": sar_evidence})
+	from backend.app.change.narrative import build_narrative
+	narrative = build_narrative(
+		before_date=row["date_before"], after_date=row["date_after"], change_region=change_region,
+		changed_fraction=changed_fraction, ndvi_change=ndvi_change, spectral_delta=row["spectral_delta"],
+		embedding_drift=row["embedding_drift"], combined_score=row["combined_score"],
+		quality="sufficient" if change_region else "source_unavailable", change_type=row["change_type"],
+		confidence=row["change_type_confidence"], earliest_supported_date=row["earliest_supported_date"],
+	)
+	result["evidence"] = {"before_date": row["date_before"], "after_date": row["date_after"], "change_region": None if source_unavailable else change_region,
+		"visual_difference_summary": visual_summary, "before_ndvi": before["ndvi_mean"], "after_ndvi": after["ndvi_mean"],
+		"ndvi_change": ndvi_change, "spectral_change": row["spectral_delta"], "semantic_change": row["embedding_drift"],
+		"quality": "source_unavailable" if source_unavailable else ("sufficient" if changed_fraction > 0 and before["valid_pixel_fraction"] and after["valid_pixel_fraction"] else "insufficient"),
+		"confound_information": quality_notes, "candidate_interpretation": interpretation, "confidence": confidence,
+		"difference_image_url": difference_url, "changed_fraction": changed_fraction if difference_url else None,
+			"centroid_x": centroid_x, "centroid_y": centroid_y, "narrative": narrative}
+	return result
+
+
+@app.post("/calibration/run")
+def run_calibration():
+	from backend.app.change.calibration import calibrate_from_audit
+	return calibrate_from_audit()
+
+
+@app.get("/calibration/results")
+def get_calibration_results():
+	from backend.app.change.calibration import calibration_results
+	result = calibration_results()
+	from backend.app.review.queue import learner_status
+	if isinstance(result, dict):
+		result["learner"] = learner_status()
+	return result
+
+
+def _export_rows(status: str) -> list[dict]:
+	decisions = latest_decisions()
+	with db.get_conn() as conn:
+		rows = conn.execute("SELECT * FROM change_candidates ORDER BY candidate_id").fetchall()
+	output = []
+	for row in rows:
+		current_status = candidate_status(row, decisions)
+		if status != "all" and current_status != status.upper():
+			continue
+		before = db.get_tile(row["vector_id_before"])
+		after = db.get_tile(row["vector_id_after"])
+		aoi = db.get_aoi(after["aoi_id"] if after else None)
+		decision_row = decisions.get(row["candidate_id"])
+		def provenance(tile):
+			if tile is None:
+				return None
+			with db.get_conn() as conn:
+				scene = conn.execute("SELECT * FROM scenes WHERE scene_path=?", (tile["scene_path"],)).fetchone()
+			return {"scene_path": tile["scene_path"], "acquisition_date": tile["acquisition_date"], "sensor": tile["sensor"],
+					"cloud_cover_percent": scene["cloud_cover_percent"] if scene else None,
+					"acquisition_date_source": scene["acquisition_date_source"] if scene else None}
+		output.append({"candidate_id": str(row["candidate_id"]), "tile_id": row["tile_id"], "aoi_name": aoi["name"] if aoi else None,
+			"change_type": row["change_type"], "confidence": row["change_type_confidence"], "combined_score": row["combined_score"],
+			"date_before": row["date_before"], "date_after": row["date_after"], "earliest_supported_date": row["earliest_supported_date"],
+			"embedding_drift": row["embedding_drift"], "spectral_delta": row["spectral_delta"], "pixel_diff_score": row["pixel_diff_score"] if "pixel_diff_score" in row.keys() and row["pixel_diff_score"] is not None else row["changed_fraction"],
+			"suppression_reason": row["suppression_reason"], "analyst_decision": decision_row["analyst_decision"] if decision_row else None,
+			"decision_reason": decision_row["reason"] if decision_row else None, "decision_timestamp": decision_row["decided_at"] if decision_row else None,
+			"processing_version": db.PROCESSING_VERSION, "model_name": "RemoteCLIP-ViT-B-32", "scene_before": provenance(before), "scene_after": provenance(after),
+			"change_region": row["change_region"]})
+	return output
+
+
+@app.get("/export")
+def export_results(format: str = Query("json", pattern="^(json|csv)$"), status: str = Query("all")):
+	rows = _export_rows(status)
+	if format == "json":
+		return JSONResponse(rows)
+	if not rows:
+		return Response(content="", media_type="text/csv", headers={"Content-Disposition": "attachment; filename=change-export.csv"})
+	fields = list(rows[0].keys())
+	output = io.StringIO()
+	writer = csv.DictWriter(output, fieldnames=fields)
+	writer.writeheader()
+	for row in rows:
+		writer.writerow({key: json.dumps(value) if isinstance(value, (dict, list)) else value for key, value in row.items()})
+	return Response(content=output.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=change-export.csv"})
+
+
+def _quality_notes(before, after) -> list[str]:
+	def percent(row, field, label):
+		value = row[field]
+		return f"{label}: {value * 100:.0f}%" if value is not None else f"{label} unavailable"
+
+	return [
+		percent(before, "cloud_fraction", "Before-date cloud fraction"),
+		percent(after, "cloud_fraction", "After-date cloud fraction"),
+		percent(before, "valid_pixel_fraction", "Before-date valid pixels"),
+		percent(after, "valid_pixel_fraction", "After-date valid pixels"),
+		percent(before, "snow_fraction", "Before-date snow fraction"),
+		percent(after, "snow_fraction", "After-date snow fraction"),
+	]
+
+
+@app.post("/review/{candidate_id}/decision", response_model=ReviewResponse)
+def decision(candidate_id: str, payload: ReviewDecision):
+	if payload.decision not in ("CONFIRM", "REJECT"):
+		raise HTTPException(422, "decision must be CONFIRM or REJECT")
+	review_queue.submit_decision(int(candidate_id), payload.decision.lower(), payload.reason)
+	return {"ok": True}
+
+
+@app.get("/review/audit-log", response_model=list[AuditLogEntry])
+def audit_log():
+	with db.get_conn() as conn:
+		rows = conn.execute("SELECT al.*, cc.tile_id FROM audit_log al LEFT JOIN change_candidates cc ON cc.candidate_id=al.candidate_id ORDER BY al.decided_at DESC").fetchall()
+	return [{"log_id": str(row["log_id"]), "candidate_id": str(row["candidate_id"]), "tile_id": row["tile_id"], "decision": row["analyst_decision"], "reason": row["reason"], "created_at": row["decided_at"]} for row in rows]
+
+
+@app.get("/clusters", response_model=list[Cluster])
+def clusters(request: Request):
+	with db.get_conn() as conn:
+		rows = conn.execute("SELECT cluster_id, COUNT(*) member_count, MIN(acquisition_date) start_date, MAX(acquisition_date) end_date FROM tiles WHERE cluster_id IS NOT NULL AND cluster_id != -1 GROUP BY cluster_id ORDER BY cluster_id").fetchall()
+	output = []
+	for row in rows:
+		with db.get_conn() as conn:
+			aois = conn.execute("SELECT DISTINCT a.name FROM tiles t JOIN aois a ON a.aoi_id=t.aoi_id WHERE t.cluster_id=? ORDER BY a.name", (row["cluster_id"],)).fetchall()
+		members = clustering.get_tiles_in_cluster(row["cluster_id"])
+		index = VectorIndex()
+		vectors = [(member, index.get_vector(member["vector_id"])) for member in members]
+		centroid = np.mean([vector for _, vector in vectors], axis=0)
+		centroid /= np.linalg.norm(centroid) + 1e-8
+		representative = max(vectors, key=lambda item: float(np.dot(item[1], centroid)))[0] if vectors else None
+		url = public_url(request, tile_thumbnail(representative["tile_path"], GENERATED_DIR / "thumbnails", representative["vector_id"])) if representative and Path(representative["tile_path"]).exists() and has_valid_multispectral_data(representative["tile_path"]) else None
+		output.append({"cluster_id": row["cluster_id"], "member_count": row["member_count"], "aoi_ids": [item[0] for item in aois], "representative_thumbnail_url": url, "label": None, "start_date": row["start_date"], "end_date": row["end_date"]})
+	return output
+
+
+@app.get("/clusters/{cluster_id}/members", response_model=list[ClusterMember])
+def cluster_members(cluster_id: int, request: Request):
+	output = []
+	for row in clustering.get_tiles_in_cluster(cluster_id):
+		aoi = db.get_aoi(row["aoi_id"])
+		thumbnail = public_url(request, tile_thumbnail(row["tile_path"], GENERATED_DIR / "thumbnails", row["vector_id"])) if Path(row["tile_path"]).exists() and has_valid_multispectral_data(row["tile_path"]) else None
+		output.append({"tile_id": row["tile_id"], "vector_id": row["vector_id"], "aoi_id": aoi["name"] if aoi else None,
+					   "date": row["acquisition_date"], "thumbnail_url": thumbnail})
+	return output
+
+
+def update_job(job_id: str, **values):
+	with JOB_LOCK:
+		JOBS[job_id].update(values)
+
+
+def run_onboarding(job_id: str, name: str, source_folder: str, discovered_count: int):
+	update_job(job_id, status="running")
+	try:
+		report = onboarding.onboard_aoi(name, source_folder, on_scene_done=lambda _outcome, completed, total: update_job(job_id, progress=int(completed / max(total, 1) * 100)))
+		update_job(job_id, status="done", progress=100, message=None, aoi_id=name, scenes_found=discovered_count, scenes_ingested=report.n_ingested,
+				   scenes_failed=report.n_failed, tiles_added=report.total_tiles_added, warnings=report.validation.warnings,
+				   scenes=[{"scene_id": scene_id(name, item.acquisition_date), "date": item.acquisition_date, "status": item.status, "message": item.error} for item in report.scene_outcomes])
+	except Exception as error:
+		update_job(job_id, status="failed", message=str(error))
+
+
+@app.post("/aois/onboard", response_model=OnboardJob)
+def start_onboard(payload: OnboardRequest, background_tasks: BackgroundTasks):
+	job_id = str(uuid.uuid4())
+	source = Path(payload.source_folder)
+	if not source.is_dir():
+		raise HTTPException(400, f"Source folder does not exist on the backend host: {payload.source_folder}")
+	discovered_count = onboarding.count_input_files(source)
+	if discovered_count == 0:
+		raise HTTPException(400, "Source folder contains no complete prepared scenes")
+	with JOB_LOCK:
+		JOBS[job_id] = {"job_id": job_id, "status": "queued", "progress": 0, "message": f"Queued {discovered_count} scene(s)", "aoi_id": payload.name, "scenes_found": discovered_count, "scenes_ingested": None, "scenes_failed": None, "tiles_added": None, "warnings": [], "scenes": []}
+	background_tasks.add_task(run_onboarding, job_id, payload.name, payload.source_folder, discovered_count)
+	return JOBS[job_id]
+
+
+@app.get("/aois/onboard/{job_id}", response_model=OnboardJob)
+def onboard_job(job_id: str):
+	with JOB_LOCK:
+		job = JOBS.get(job_id)
+	if job is None:
+		raise HTTPException(404, "Onboarding job not found")
+	return job
+
+
+@app.post("/sar/observations")
+def ingest_sar_observation(payload: SARIngestRequest):
+	"""Compute and register a Sentinel-1 raster in the canonical SAR tile store."""
+	from backend.app.geospatial.sar_features import compute_sar_features
+	db.init_db()
+	features = compute_sar_features(payload.scene_path)
+	sar_id = db.register_sar_tile(
+		tile_id=payload.tile_id or Path(payload.scene_path).stem,
+		tile_path=payload.scene_path,
+		features=features,
+		product_type=payload.product_type,
+		aoi_id=payload.aoi_id,
+		period_start=payload.period_start or payload.acquisition_date,
+		period_end=payload.period_end or payload.acquisition_date,
+		acquisition_datetime=payload.acquisition_date,
+		metadata=payload.metadata,
+	)
+	return {"ok": True, "sar_tile_id": sar_id, "features": features.__dict__}
+
+
+@app.get("/sar/observations")
+def sar_observations(tile_id: str | None = None):
+	return [dict(row) for row in db.list_sar_observations(tile_id)]
+
+
+@app.get("/changes/{candidate_id}/explanations")
+def candidate_explanations(candidate_id: int):
+	with db.get_conn() as conn:
+		row = conn.execute("SELECT * FROM change_candidates WHERE candidate_id=?", (candidate_id,)).fetchone()
+	if row is None:
+		raise HTTPException(404, "Candidate not found")
+	spectral_heatmap = row["heatmap_spectral"]
+	if not spectral_heatmap:
+		before, after = db.get_tile(row["vector_id_before"]), db.get_tile(row["vector_id_after"])
+		if before and after and Path(before["tile_path"]).exists() and Path(after["tile_path"]).exists():
+			try:
+				import rasterio
+				with rasterio.open(before["tile_path"]) as src:
+					before_data = src.read([1, 2, 3, 4])
+				with rasterio.open(after["tile_path"]) as src:
+					after_data = src.read([1, 2, 3, 4])
+				maps = heatmap.explainable_heatmaps(before_data, after_data)
+				spectral_heatmap = maps["spectral"]
+				with db.get_conn() as conn:
+					conn.execute("UPDATE change_candidates SET heatmap_spectral=?, heatmap_attention=? WHERE candidate_id=?",
+						(spectral_heatmap, maps.get("attention"), candidate_id))
+			except (OSError, ValueError):
+				spectral_heatmap = None
+	return {"candidate_id": candidate_id, "modality": row["modality"], "land_cover": row["land_cover"],
+			"priority_score": row["priority_score"], "priority_reasons": json.loads(row["priority_reasons"] or "[]"),
+			"heatmap_spectral": spectral_heatmap, "heatmap_attention": row["heatmap_attention"],
+			"narrative": row["llm_narrative"] or row["narrative"]}
+
+
+@app.post("/changes/{candidate_id}/brief")
+def generate_candidate_brief(candidate_id: int):
+	from backend.app.change.llm_brief import generate_llm_brief
+	with db.get_conn() as conn:
+		row = conn.execute("SELECT * FROM change_candidates WHERE candidate_id=?", (candidate_id,)).fetchone()
+	if row is None:
+		raise HTTPException(404, "Candidate not found")
+	facts = {key: row[key] for key in (
+		"date_before", "date_after", "change_type", "change_type_confidence",
+		"spectral_delta", "embedding_drift", "combined_score", "earliest_supported_date",
+		"changed_fraction", "modality", "sar_score", "fused_score",
+	) if key in row.keys() and row[key] is not None}
+	brief_text = generate_llm_brief(facts)
+	if brief_text is not None:
+		with db.get_conn() as conn:
+			conn.execute("UPDATE change_candidates SET llm_narrative=? WHERE candidate_id=?", (brief_text, candidate_id))
+	return {"candidate_id": candidate_id, "llm_narrative": brief_text}
+
+
+@app.get("/aois/{aoi_id}/narrative")
+def aoi_narrative(aoi_id: str):
+	aoi = aoi_row(aoi_id)
+	with db.get_conn() as conn:
+		rows = conn.execute("SELECT * FROM change_candidates cc JOIN tiles t ON t.vector_id=cc.vector_id_after "
+			"WHERE t.aoi_id=? AND cc.suppressed=0", (aoi["aoi_id"],)).fetchall()
+	return {"aoi_id": aoi_id, "narrative": brief.aoi_narrative(aoi["name"], [dict(r) for r in rows])}
+
+
+if FRONTEND_DIST.exists():
+	app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
